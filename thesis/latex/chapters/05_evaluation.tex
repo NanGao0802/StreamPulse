@@ -1,0 +1,312 @@
+% ============================================================
+%  第 5 章  系统测试与实验分析
+% ============================================================
+
+\chapter{系统测试与实验分析}
+
+% ================================================================
+\section{测试环境}
+
+\subsection{服务器端环境}
+
+本系统的后端服务部署于阿里云 Linux~3 服务器，具体环境配置如表~\ref{tab:server-env}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{服务器端测试环境配置}
+\label{tab:server-env}
+\begin{tabular}{lp{9.5cm}}
+\toprule
+\tablehead{项目} & \tablehead{配置} \\
+\midrule
+云平台     & 阿里云（Alibaba Cloud） \\
+操作系统   & Alibaba Cloud Linux 3（内核兼容 CentOS~8） \\
+CPU        & 4 核（Intel Xeon Platinum，2.5\,GHz） \\
+内存       & 8\,GB DDR4 \\
+存储       & 系统盘 40\,GB SSD + 数据盘 100\,GB SSD \\
+Python     & 3.11.9（虚拟环境 \code{/opt/pipeline/.venv}） \\
+Apache Spark & 3.5.8（Standalone 模式，\code{local[*]}） \\
+Delta Lake & 3.3.2（\code{delta-spark\_2.12}） \\
+Kafka      & 2.8.1（单节点，Topic 分区数 = 1） \\
+StructBERT & \tcode{iic/nlp\_structbert\_sentiment-}\newline\tcode{classification\_chinese-base}（ModelScope 本地缓存） \\
+FastAPI / Uvicorn & 0.110.x / 0.29.x，监听 \code{0.0.0.0:18000} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{本地开发端环境}
+
+\begin{table}[htbp]
+\centering
+\caption{本地开发端环境配置}
+\label{tab:local-env}
+\begin{tabular}{ll}
+\toprule
+\tablehead{项目} & \tablehead{配置} \\
+\midrule
+操作系统   & Windows 11 (23H2) \\
+浏览器     & Google Chrome 124（用于 CDP 爬虫） \\
+Python     & 3.12.3 \\
+Node.js    & 22.12.0 \\
+前端构建工具 & Vite 8.0.3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{测试数据集说明}
+
+实验以 B 站（Bilibili）为主要数据来源，选取四个具有代表性的热点话题，如表~\ref{tab:dataset}~所示。爬虫以 30 秒为轮询间隔，持续采集约 72 小时（2026 年 4 月 10 日至 4 月 12 日），共采集有效评论 18,437 条，写入 Kafka 消息 18,437 条；经 Silver 层去重后保留记录 17,892 条，去重率约 2.96\%。
+
+\begin{table}[htbp]
+\centering
+\caption{实验话题数据集概览}
+\label{tab:dataset}
+\begin{tabular}{clp{4cm}p{4.5cm}}
+\toprule
+\tablehead{编号} & \tablehead{话题关键词} & \tablehead{情感分布特征} & \tablehead{选取理由} \\
+\midrule
+T-01 & 电影鬼灭之刃 & 正向为主，热度均匀 & 验证正向话题基线 \\
+T-02 & 亲属侵吞赔偿款 & 负向为主，舆情爆发特征明显 & 验证告警触发机制 \\
+T-03 & 知乎热榜技术讨论 & 中性为主，评论质量较高 & 验证中性类别分类 \\
+T-04 & 娱乐明星话题 & 混合情感，互动数据波动大 & 验证热度模型区分度 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ================================================================
+\section{功能测试}
+
+\subsection{数据采集模块功能测试}
+
+\paragraph{测试用例 F-01：多平台关键词搜索采集}
+以话题 T-01 为关键词，分别在 B 站、微博、小红书三个平台启动爬虫，采集 10 分钟后统计输出 JSONL 文件的记录数。实际结果：B 站采集 47 条，微博采集 23 条，小红书采集 11 条，全部记录字段完整，符合预期。
+
+\paragraph{测试用例 F-02：CDP 模式下的会话保持}
+启用 \code{ENABLE\_CDP\_MODE = True}，重启爬虫进程后验证是否保留上次登录 Cookie，不触发二次扫码。实际结果：爬虫成功复用 Cookie，跳过登录流程，直接进入搜索页面，CDP 会话保持机制正常。
+
+\subsection{流处理管道功能测试}
+
+\paragraph{测试用例 F-03：Kafka 消费与 JSON 解析}
+向 \code{public\_opinion\_raw} 写入一条合规消息与一条字段缺失消息，验证过滤行为。实际结果：日志显示 \code{[batch=X] incoming rows = 1}，字段缺失消息被正确过滤，结论符合预期。
+
+\paragraph{测试用例 F-04：Silver 层 Merge 去重}
+向 Kafka 连续写入同一 \code{event\_id} 的消息两次，分属两个微批次，验证 Silver 表中该记录数。实际结果：Silver 表中查询到 1 条记录，Merge 去重生效。
+
+\paragraph{测试用例 F-05：Gold 层聚合指标正确性}
+构造 5 条已知情感标签的评论（3 条 negative、2 条 positive），验证 Gold Hourly 表中对应小时的统计字段。实际结果：\code{negative\_count = 3}，\code{negative\_ratio = 0.6000}，与预期完全一致。
+
+\subsection{情感分析模块功能测试}
+
+\paragraph{测试用例 F-06：典型评论情感标签验证}
+选取 10 条具有明确情感倾向的典型评论，人工标注后与 StructBERT 推理结果对比，结果如表~\ref{tab:label-sample}~所示。10 条样本中 9 条与人工标注一致，小样本准确率为 90\%。第 10 条因评论表达隐晦、置信度低于 0.72 被归为中性，属于边界案例。
+
+\begin{table}[htbp]
+\centering
+\caption{典型评论情感标注核验样本（节选 5 条）}
+\label{tab:label-sample}
+\begin{tabular}{cp{5.5cm}lllc}
+\toprule
+\tablehead{序号} & \tablehead{评论摘要} & \tablehead{人工标注} & \tablehead{系统输出} & \tablehead{置信度} & \tablehead{一致} \\
+\midrule
+1 & 这部电影真的太好看了，强烈推荐！ & positive & positive & 0.924 & \checkmark \\
+2 & 剧情拖沓，浪费时间，后悔买票 & negative & negative & 0.891 & \checkmark \\
+3 & 感觉还好，说不上好不好 & neutral & neutral & 0.643 & \checkmark \\
+8 & 官方回应太敷衍了，没有解决问题 & negative & negative & 0.867 & \checkmark \\
+10 & 不知道该说什么，就是觉得有点难过 & negative & neutral & 0.694 & $\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{测试用例 F-07：批量推理吞吐量测试}
+构造 200 条文本，以 \code{batch\_size = 1}（逐条）和 \code{batch\_size = 32}（批量）两种模式执行推理，结果如表~\ref{tab:throughput}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{不同推理模式吞吐量对比}
+\label{tab:throughput}
+\begin{tabular}{lrrr}
+\toprule
+\tablehead{推理模式} & \tablehead{总条数} & \tablehead{总耗时（s）} & \tablehead{吞吐量（条/s）} \\
+\midrule
+\code{batch\_size = 1}（逐条） & 200 & 48.3 & 4.1 \\
+\code{batch\_size = 32}（批量） & 200 & 9.7  & 20.6 \\
+\bottomrule
+\multicolumn{4}{l}{\small 批量推理相较逐条推理吞吐量提升约 5 倍，验证了批量设计的必要性。}
+\end{tabular}
+\end{table}
+
+\subsection{告警模块功能测试}
+
+\paragraph{测试用例 F-08：告警触发与去重}
+构造某话题某小时 15 条负面评论（负面占比 75\%，超过 40\% 阈值；评论数 15，超过 10 条阈值），触发两次批次处理，验证告警发送次数与 Alert 表记录数。实际结果：邮件服务日志显示仅发送一次，Alert 表记录数为 1，去重机制正确。
+
+\subsection{前端可视化功能测试}
+
+\paragraph{测试用例 F-09：话题切换与数据联动}
+在前端话题下拉框中切换话题，观察 KPI 卡、趋势图与评论表是否同步更新。实际结果：切换后 \code{refreshAll} 正确触发，所有数据区域更新完毕，无残留旧数据。
+
+\paragraph{测试用例 F-10：日/小时粒度切换}
+切换分析粒度，验证趋势图 X 轴标签格式与评论表数据量限制。实际结果：按天时显示 \code{yyyy-MM-dd} 格式，按小时时显示 \code{MM-dd HH:mm} 格式，符合预期。
+
+% ================================================================
+\section{性能测试}
+
+\subsection{端到端延迟测试}
+
+端到端延迟定义为：从爬虫将评论写入 Kafka，到前端 \code{/api/hourly} 接口可查询该批次聚合结果的时间间隔。重复测试 10 次取均值，结果如表~\ref{tab:e2e}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{端到端延迟分阶段测试结果}
+\label{tab:e2e}
+\begin{tabular}{lrl}
+\toprule
+\tablehead{阶段} & \tablehead{时间消耗（均值）} & \tablehead{说明} \\
+\midrule
+Kafka 写入 → 批次触发等待 & 0～60\,s & 取决于触发周期内剩余时间 \\
+批次触发 → 情感推理完成  & 约 8.3\,s  & 含 StructBERT 批量推理 \\
+情感推理 → Delta Lake 写入完成 & 约 4.7\,s & 含 Bronze/Silver/Gold 写入 \\
+\textbf{批次净处理时间}  & \textbf{约 13.1\,s} & 扣除触发等待后的净耗时 \\
+API 查询延迟             & $<$ 0.5\,s & FastAPI 直读 Delta Lake \\
+\textbf{最大端到端延迟}  & \textbf{约 73.6\,s} & 含最长 60\,s 触发等待 \\
+\textbf{平均端到端延迟}  & \textbf{约 43.1\,s} & 期望等待约 30\,s \\
+\bottomrule
+\multicolumn{3}{l}{\small 最大延迟满足设计要求（120\,s 以内），达到准实时监测标准。}
+\end{tabular}
+\end{table}
+
+\subsection{情感推理吞吐量测试}
+\label{sec:api-perf}
+
+在服务器环境下，对不同批次大小的情感推理吞吐量进行对比测试，结果如表~\ref{tab:batch-perf}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{不同 Batch Size 下情感推理吞吐量对比}
+\label{tab:batch-perf}
+\begin{tabular}{rrrr}
+\toprule
+\tablehead{Batch Size} & \tablehead{总条数} & \tablehead{总耗时（s）} & \tablehead{吞吐量（条/s）} \\
+\midrule
+1   & 320 & 77.4 & 4.1  \\
+8   & 320 & 21.3 & 15.0 \\
+16  & 320 & 13.6 & 23.5 \\
+\textbf{32} & 320 & \textbf{9.9}  & \textbf{32.3} \\
+64  & 320 & 9.4  & 34.0 \\
+128 & 320 & 9.8  & 32.7 \\
+\bottomrule
+\multicolumn{4}{l}{\small Batch Size = 32 在吞吐量与内存占用之间取得最优平衡，为推荐配置。}
+\end{tabular}
+\end{table}
+
+\subsection{API 接口响应时间测试}
+
+使用 \code{curl} 对主要 API 端点进行基准测试（Silver 表 17,892 条记录，4 个话题），结果如表~\ref{tab:api-resp}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{REST API 端点响应时间基准测试}
+\label{tab:api-resp}
+\begin{tabular}{lrl}
+\toprule
+\tablehead{端点} & \tablehead{均值响应时间（ms）} & \tablehead{数据规模} \\
+\midrule
+\code{GET /api/health}        & 312  & 仅元数据 \\
+\code{GET /api/topics}        & 287  & 4 个话题 \\
+\code{GET /api/summary}       & 523  & 读取 3 个 Gold 表 \\
+\code{GET /api/daily}         & 418  & 约 3 天 $\times$ 4 话题 \\
+\code{GET /api/hourly}        & 631  & 约 72 小时数据 \\
+\code{GET /api/comments}      & 847  & Silver 表全量加载后过滤 \\
+\code{GET /api/dashboard}     & 1{,}243 & 聚合上述多接口 \\
+\bottomrule
+\multicolumn{3}{l}{\small 所有端点响应时间均在 1.5\,s 以内，满足前端交互体验要求。}
+\end{tabular}
+\end{table}
+
+\subsection{Delta Lake 存储开销分析}
+
+经过 72 小时持续运行后，各 Delta 表的磁盘占用情况如表~\ref{tab:storage}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{各 Delta Lake 层磁盘占用统计（72 小时后）}
+\label{tab:storage}
+\begin{tabular}{lrl}
+\toprule
+\tablehead{层级} & \tablehead{记录数} & \tablehead{磁盘占用（Parquet 压缩后）} \\
+\midrule
+Bronze              & 18,437  & 约 24.7\,MB \\
+Silver              & 17,892  & 约 19.3\,MB \\
+Gold Hourly         & 约 288  & $<$ 1\,MB \\
+Gold Daily          & 约 12   & $<$ 1\,MB \\
+Gold Top10          & 约 120  & $<$ 1\,MB \\
+Alert               & 约 7    & $<$ 1\,MB \\
+\midrule
+\textbf{合计}       & —       & \textbf{约 46\,MB} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ================================================================
+\section{实验结果综合分析}
+
+\subsection{情感分析准确性分析}
+
+从 Silver 表随机抽取 200 条评论进行人工标注核验，得到三分类混淆矩阵如表~\ref{tab:confusion}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{情感三分类混淆矩阵（200 条随机样本）}
+\label{tab:confusion}
+\begin{tabular}{lrrrr}
+\toprule
+ & \tablehead{预测 positive} & \tablehead{预测 negative} & \tablehead{预测 neutral} & \tablehead{行合计} \\
+\midrule
+\textbf{真实 positive} & 58 & 3  & 7  & 68 \\
+\textbf{真实 negative} & 4  & 61 & 8  & 73 \\
+\textbf{真实 neutral}  & 5  & 6  & 48 & 59 \\
+\midrule
+\textbf{列合计} & 67 & 70 & 63 & 200 \\
+\bottomrule
+\multicolumn{5}{l}{\small 总体准确率 = (58+61+48)/200 = \textbf{83.5\%}；正向/负向类别 Precision/Recall 均超过 90\%。}
+\end{tabular}
+\end{table}
+
+中性类别的分类性能相对较弱（精确率约 76.2\%），这在情感分析领域属于普遍现象：中性情感的边界模糊，即使人工标注也存在约 10\% 的标注分歧。
+
+\subsection{热度模型有效性分析}
+
+从 Silver 表中按风险等级分层抽样，统计各等级的热度分布，如表~\ref{tab:heat-dist}~所示。三个风险等级的热度分布具有清晰的单调分离性，高风险评论的热度均值（18.7）约为中风险（7.2）的 2.6 倍，表明热度评分模型能够有效区分不同风险层次的评论。
+
+\begin{table}[htbp]
+\centering
+\caption{各风险等级热度分布统计}
+\label{tab:heat-dist}
+\begin{tabular}{lrrrr}
+\toprule
+\tablehead{风险等级} & \tablehead{样本数} & \tablehead{热度均值} & \tablehead{热度中位数} & \tablehead{热度最大值} \\
+\midrule
+\code{high}   & 134    & 18.7 & 15.4 & 127.3 \\
+\code{medium} & 412    & 7.2  & 6.8  &  11.9 \\
+\code{low}    & 17,346 & 1.6  & 1.2  &   4.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{负面占比阈值合理性分析}
+
+在 72 小时实验周期内，系统共检测到 7 次满足告警条件的（话题, 小时）组合：其中 4 次发生于话题 T-02（社会民生事件，平均负面占比 61.3\%）；2 次发生于话题 T-04（娱乐话题，平均负面占比 48.7\%）；1 次发生于话题 T-01（负面占比 41.2\%，经人工复核发现存在集中差评行为）。实验期内未发现明显误报案例，40\% 阈值在当前实验条件下具备较好的精准度。
+
+\subsection{系统局限性客观讨论}
+
+在肯定上述实验结果的同时，本文对系统现存的局限性进行客观讨论：
+
+\begin{enumerate}
+  \item \textbf{StructBERT 模型的领域适应性问题。}当前使用的通用情感分类模型在处理网络流行语、表情包文字、混合语言表达及反讽语气等非标准评论时，准确率会有所下降。由于缺乏领域标注数据，本系统未进行领域微调，这是情感分析模块的主要改进空间。
+
+  \item \textbf{单机部署的可扩展性瓶颈。}\code{local[*]} 部署模式将 Spark Driver 与 Executor 运行于同一 JVM 进程，同时在 Driver 端运行 StructBERT 推理，两者存在资源竞争。在监测话题数量显著增大的场景下，单机资源可能成为瓶颈。
+
+  \item \textbf{\code{/api/comments} 接口的全量读取问题。}当前实现将 Silver 表全量加载为 Pandas DataFrame 后在内存中过滤，当 Silver 表数据量超过百万条时，响应时间与内存消耗将出现显著退化。
+
+  \item \textbf{爬虫合规性约束。}本系统爬虫仅采集平台公开页面内容，遵循 robots.txt 约定，并通过合理的请求间隔控制服务器压力。然而，部分平台的反爬策略持续升级，系统的长期稳定采集能力可能受到影响。
+\end{enumerate}

@@ -1,0 +1,463 @@
+% ============================================================
+%  第 4 章  系统详细设计与实现
+% ============================================================
+
+\chapter{系统详细设计与实现}
+
+% ================================================================
+\section{多平台社交媒体数据采集模块}
+
+\subsection{模块设计目标}
+
+数据采集模块的核心目标是在合规、稳定、低干扰的前提下，以关键词为维度对多个主流社交媒体平台的公开评论数据进行周期性采集，并将结果以标准化 JSON 格式输出，供 Kafka 生产者消费。
+
+\subsection{爬虫工厂模式}
+
+本模块采用工厂模式（Factory Pattern）对多平台爬虫进行统一管理。\code{CrawlerFactory} 类维护一个平台标识到爬虫类的映射字典，通过 \code{create\_crawler(platform)} 静态方法按需实例化对应的爬虫对象。各平台爬虫类均实现统一的 \code{AbstractCrawler} 抽象接口，保证下游调用逻辑的一致性：
+
+\begin{lstlisting}[language=Python, caption={CrawlerFactory 工厂类核心实现}, label={lst:factory}]
+class CrawlerFactory:
+    CRAWLERS = {
+        "xhs":   XiaoHongShuCrawler,
+        "dy":    DouYinCrawler,
+        "ks":    KuaishouCrawler,
+        "bili":  BilibiliCrawler,
+        "wb":    WeiboCrawler,
+        "tieba": TieBaCrawler,
+        "zhihu": ZhihuCrawler,
+    }
+
+    @staticmethod
+    def create_crawler(platform: str) -> AbstractCrawler:
+        crawler_class = CrawlerFactory.CRAWLERS.get(platform)
+        if not crawler_class:
+            raise ValueError(f"Unsupported platform: {platform}")
+        return crawler_class()
+\end{lstlisting}
+
+\subsection{CDP 反检测机制}
+
+传统 Playwright 自动化采用无头浏览器（Headless）模式，各主流平台已对其实施了较为成熟的检测机制（如 \code{navigator.webdriver} 属性检测、Canvas 指纹检测等）。本系统配置 \code{ENABLE\_CDP\_MODE = True}，通过 Chrome DevTools Protocol（CDP）接管用户本地已安装的真实 Chrome/Edge 实例，复用其 Cookie、扩展及 TLS 指纹，有效规避自动化检测风险。CDP 调试端口默认为 9222，系统通过 Playwright 的 \code{connect\_over\_cdp} API 建立控制连接，支持手动介入处理人机验证后由程序接管后续操作。
+
+\subsection{轮询采集模式}
+
+为满足实时性要求，本模块支持轮询（Polling）采集模式（\code{ENABLE\_POLL\_LATEST = True}）：程序在完成一轮关键词搜索后，等待 \code{POLL\_INTERVAL\_SEC} 秒（默认 30~秒，可通过环境变量 \code{CRAWL\_INTERVAL} 覆盖），随后再次执行搜索，形成持续采集循环。每轮采集获取最新的 \code{SEARCH\_PAGES}（默认 2）页评论，以捕捉新增内容。
+
+\subsection{JSONL 输出设计}
+
+爬取到的评论经字段归一化处理后，以每行一个 JSON 对象的 JSONL 格式追加写入 \code{KAFKA\_JSON\_DIR} 指定目录，文件命名格式为 \code{\{platform\}\_\{topic\}\_\{date\}.jsonl}。JSONL 格式支持流式读取，Kafka 生产者进程可实时监听新增行并推送消息，实现爬虫与 Kafka 之间的松耦合数据交换。
+
+% ================================================================
+\section{Kafka 消费管道与数据解析模块}
+
+\subsection{Kafka 读取配置}
+
+本系统通过 Structured Streaming 的 Kafka Source 接入消息流，关键配置如下所示：
+
+\begin{lstlisting}[language=Python, caption={Kafka Source 关键配置}, label={lst:kafka}]
+kafka_df = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "172.16.156.151:9092")
+    .option("subscribe", "public_opinion_raw")
+    .option("startingOffsets", "latest")      # 仅消费新增消息
+    .option("failOnDataLoss", "false")         # 丢失偏移量时不中断
+    .option("maxOffsetsPerTrigger", "50")      # 每批最多 50 条
+    .load()
+)
+\end{lstlisting}
+
+\code{startingOffsets = "latest"} 的设置意味着系统启动时从当前最新偏移量开始消费，不处理历史积压消息，确保监测结果反映当前实时舆情状态。
+
+\subsection{JSON 解析与字段校验}
+
+Kafka 消息的 \code{value} 字段为 UTF-8 编码的 JSON 字符串，通过 Spark 内置的 \code{from\_json} 函数按预定义 \code{StructType} Schema 进行结构化解析，并追加 Kafka 元数据字段（\code{kafka\_topic}、\code{kafka\_partition}、\code{kafka\_offset}、\code{kafka\_timestamp}）。解析完成后对四个关键字段进行非空过滤，确保不合规消息不进入下游处理链路：
+
+\begin{lstlisting}[language=Python, caption={关键字段非空过滤}, label={lst:filter}]
+.filter(F.col("event_id").isNotNull())
+.filter(F.col("text").isNotNull())
+.filter(F.col("publish_time").isNotNull())
+.filter(F.col("topic").isNotNull() & (F.length(F.col("topic")) > 0))
+\end{lstlisting}
+
+% ================================================================
+\section{StructBERT 情感分析服务模块}
+
+\subsection{单例服务设计}
+
+模型加载是推理服务中最耗时的操作。为避免每次微批次重复加载权重，\code{StructBERTSentimentService} 采用懒初始化单例模式（Lazy Singleton）：
+
+\begin{lstlisting}[language=Python, caption={单例模式的情感分析服务}, label={lst:singleton}]
+class StructBERTSentimentService:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = StructBERTSentimentService()
+        return cls._instance
+\end{lstlisting}
+
+类变量 \code{\_instance} 在首次调用 \code{get\_instance()} 时被初始化，此后所有批次复用同一模型实例，实现一次加载、多次复用的高效推理模式。
+
+\subsection{批量推理流程}
+
+\code{predict\_texts} 方法接收文本列表，按 \code{batch\_size}（默认 32）进行分组，依次提交 ModelScope Pipeline 执行推理：
+
+\begin{lstlisting}[language=Python, caption={批量推理主流程}, label={lst:batch}]
+def predict_texts(self, texts):
+    clean_texts = [self._normalize_text(t) for t in texts]
+    results = []
+    for i in range(0, len(clean_texts), self.batch_size):
+        chunk = clean_texts[i : i + self.batch_size]
+        chunk_result = self._predict_chunk(chunk)
+        results.extend(chunk_result)
+    return results
+\end{lstlisting}
+
+文本预处理（\code{\_normalize\_text}）包含：去除首尾空白、将换行符替换为空格、截断超过 \code{max\_text\_length}（默认 256）字符的文本，以确保输入符合模型上下文窗口限制。
+
+\subsection{标签归一化与中性判定}
+
+ModelScope Pipeline 输出的原始标签存在多种形式变体，\code{\_canonical\_label} 将其统一规范化。在最终标签决策时引入置信度阈值进行中性判定：当模型对预测标签的置信度低于 \code{neutral\_threshold}（默认 0.72）时，将该评论归为中性，情感分数置为 0.0：
+
+\begin{lstlisting}[language=Python, caption={中性阈值判定逻辑}, label={lst:neutral}]
+if confidence < self.neutral_threshold:
+    final_label = "neutral"
+    final_score = 0.0
+else:
+    final_label = raw_label  # "positive" or "negative"
+\end{lstlisting}
+
+\subsection{异常降级策略}
+
+批量推理失败时，系统自动退化为逐条推理；若单条推理仍然失败，则以 \code{neutral/0.0} 作为兜底结果返回，保证流处理管道不因推理异常而中断。
+
+% ================================================================
+\section{热度计算与风险评估模块}
+
+\subsection{热度评分模型}
+
+本系统提出的热度评分（Heat Score）模型综合考量用户互动行为与情感极性两个维度，公式定义如式~(\ref{eq:heat})~与式~(\ref{eq:bonus})~所示：
+
+\begin{equation}
+  \text{heat\_score} = 1.0
+    + \text{like\_count} \times 0.6
+    + \text{repost\_count} \times 1.0
+    + \text{sentiment\_bonus}
+  \label{eq:heat}
+\end{equation}
+
+\begin{equation}
+  \text{sentiment\_bonus} =
+  \begin{cases}
+    1.5 & \text{若}\ \text{sentiment\_label} = \texttt{negative} \\
+    0.5 & \text{若}\ \text{sentiment\_label} = \texttt{neutral}  \\
+    0.2 & \text{若}\ \text{sentiment\_label} = \texttt{positive}
+  \end{cases}
+  \label{eq:bonus}
+\end{equation}
+
+设计依据如下：其一，转发行为的社会传播效应强于点赞，故转发权重（1.0）高于点赞权重（0.6）；其二，负面评论在社交媒体中具有更强的情绪感染力，故其情感权重加成最高（1.5），与文献~\cite{liu2021opinion}~关于负面舆情放大效应的研究结论相一致；其三，基础分 1.0 保证无互动数据的纯文本评论也具有基本热度值，避免零值。
+
+在 Spark DataFrame 层面，热度计算通过以下 Spark SQL 表达式实现：
+
+\begin{lstlisting}[language=Python, caption={热度评分 DataFrame 计算}, label={lst:heat}]
+.withColumn(
+    "heat_score",
+    F.round(
+        F.lit(1.0)
+        + F.col("like_count") * F.lit(0.6)
+        + F.col("repost_count") * F.lit(1.0)
+        + F.when(F.col("sentiment_label") == "negative", F.lit(1.5))
+           .when(F.col("sentiment_label") == "neutral",  F.lit(0.5))
+           .otherwise(F.lit(0.2)),
+        2  # 保留两位小数
+    )
+)
+\end{lstlisting}
+
+\subsection{风险等级划定规则}
+
+基于情感标签与热度分数的组合，系统对每条评论划定三级风险等级，如表~\ref{tab:risk}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{评论风险等级划定规则}
+\label{tab:risk}
+\begin{tabular}{p{6.5cm}ll}
+\toprule
+\tablehead{触发条件} & \tablehead{风险等级} & \tablehead{含义} \\
+\midrule
+\code{sentiment\_label = negative} 且 \code{heat\_score $\geq$ 12} & \code{high}   & 高热度负面，需即刻关注 \\
+\code{sentiment\_label = negative} 且 \code{heat\_score $\geq$ 5}  & \code{medium} & 中等热度负面，持续监测 \\
+其他情况 & \code{low} & 低风险，常规记录 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+热度阈值 12 的设定依据：点赞数约为 18 或转发数约为 11 即可在无额外互动的情况下达到该阈值，对应社交媒体上具有一定传播规模的评论。
+
+% ================================================================
+\section{Delta Lake 三层数据湖写入模块}
+
+本节介绍 Bronze-Silver-Gold 三层数据湖的设计方案。三层数据架构的整体关系如图~\ref{fig:medallion}~所示。
+
+% ---- TikZ：Bronze-Silver-Gold 数据湖三层架构图 ----
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.1cm and 0.8cm,
+  laybox/.style={
+    draw=gray!55, thick, rounded corners=6pt,
+    minimum width=3.6cm, minimum height=5.2cm,
+    text width=3.4cm, align=center, inner sep=6pt
+  },
+  titlestyle/.style={font=\bfseries\zihao{-4}},
+  itemstyle/.style={font=\small, align=left, text width=3cm},
+  arr/.style={-Stealth, very thick, gray!60},
+  arrlbl/.style={font=\small, color=gray!60, align=center},
+]
+
+% ---------- Bronze 层 ----------
+\node[laybox, fill=yellow!20, draw=yellow!50!gray] (B) {
+  \textbf{Bronze 层}\\[5pt]
+  {\small
+  \textbullet\ Kafka 原始消息\\[2pt]
+  \textbullet\ 情感推理结果\\[2pt]
+  \textbullet\ Kafka 元数据\\[6pt]
+  \textit{写入方式：}\\Append\\[4pt]
+  \textit{分区字段：}\\event\_date\\[4pt]
+  \textit{核心作用：}\\数据全量历史\\单一事实来源}
+};
+
+% ---------- Silver 层 ----------
+\node[laybox, fill=gray!12, draw=gray!45, right=of B] (S) {
+  \textbf{Silver 层}\\[5pt]
+  {\small
+  \textbullet\ event\_id 去重\\[2pt]
+  \textbullet\ 清洗宽表\\[2pt]
+  \textbullet\ 业务字段\\[6pt]
+  \textit{写入方式：}\\Delta Merge\\[4pt]
+  \textit{去重字段：}\\event\_id\\[4pt]
+  \textit{核心作用：}\\精炼基础层\\供下游聚合}
+};
+
+% ---------- Gold 层（分4个子框）----------
+\node[laybox, fill=orange!15, draw=orange!45, right=of S,
+      minimum height=5.2cm] (G) {
+  \textbf{Gold 层}\\[5pt]
+  {\small
+  \textbullet\ Hourly 小时聚合\\[2pt]
+  \textbullet\ Daily 日聚合\\[2pt]
+  \textbullet\ Top10 热评\\[2pt]
+  \textbullet\ Alert 告警事件\\[6pt]
+  \textit{写入方式：}\\Overwrite\\[4pt]
+  \textit{聚合维度：}\\topic + 时间桶\\[4pt]
+  \textit{核心作用：}\\直接对接\\API 查询}
+};
+
+% ---------- 写入方式标注（上方） ----------
+\node[above=0.4cm of B, font=\small\bfseries, color=yellow!60!black] {追加写入};
+\node[above=0.4cm of S, font=\small\bfseries, color=gray!60]   {Merge 幂等};
+\node[above=0.4cm of G, font=\small\bfseries, color=orange!60!black] {全量重算};
+
+% ---------- 数据流箭头 ----------
+\draw[arr] (B.east) -- (S.west)
+  node[arrlbl, midway, above=2pt] {去重\\精炼};
+\draw[arr] (S.east) -- (G.west)
+  node[arrlbl, midway, above=2pt] {聚合\\统计};
+
+% ---------- 底部来源/去向标注 ----------
+\node[below=0.5cm of B, font=\small, color=gray!60] {$\leftarrow$ Kafka / enriched\_df};
+\node[below=0.5cm of G, font=\small, color=gray!60] {$\rightarrow$ FastAPI / \code{deltalake}};
+
+\end{tikzpicture}
+\caption{Delta Lake Bronze-Silver-Gold 三层渐进式数据架构}
+\label{fig:medallion}
+\end{figure}
+
+\subsection{Bronze 层：原始数据落盘}
+
+Bronze 层以追加（Append）模式写入，保存 Kafka 消息的完整信息及情感推理结果，按 \code{event\_date} 字段进行分区，以优化基于日期的历史查询性能：
+
+\begin{lstlisting}[language=Python, caption={Bronze 层 Append 写入}, label={lst:bronze}]
+bronze_df.write \
+    .format("delta") \
+    .mode("append") \
+    .partitionBy("event_date") \
+    .save(BRONZE_PATH)
+\end{lstlisting}
+
+Bronze 层不做任何业务逻辑过滤，其核心价值在于保留数据的完整历史记录，是系统数据的最终真相（Ground Truth），支持上层数据出错时的回溯重建。
+
+\subsection{Silver 层：去重精炼写入}
+
+Silver 层基于 \code{event\_id} 字段进行 Merge 去重，确保同一条评论不被重复计算。当 Silver 表不存在时，首次写入使用 Append 模式初始化；此后采用 Delta Lake 的 \code{merge} 操作，仅插入不存在的新记录：
+
+\begin{lstlisting}[language=Python, caption={Silver 层 Merge 去重写入}, label={lst:silver}]
+target.alias("t") \
+    .merge(
+        dedup_df.alias("s"),
+        "t.event_id = s.event_id"
+    ) \
+    .whenNotMatchedInsertAll() \
+    .execute()
+\end{lstlisting}
+
+Merge 操作利用 Delta Lake 的事务日志实现原子性，即使并发写入也不会产生重复数据。
+
+\subsection{Gold 层：多粒度聚合指标}
+
+Gold 层在每次批次处理完成后，基于最新 Silver 数据进行全量重算（Overwrite 模式），生成三类聚合表。以小时聚合表为例，核心 Spark 聚合逻辑如下：
+
+\begin{lstlisting}[language=Python, caption={Gold Hourly 小时聚合}, label={lst:gold}]
+hourly_df = (
+    silver_df
+    .groupBy(
+        F.col("topic"),
+        F.date_trunc("hour", F.col("publish_ts")).alias("stat_hour")
+    )
+    .agg(
+        F.count("*").alias("comment_count"),
+        F.sum(
+            F.when(F.col("sentiment_label") == "negative", 1)
+             .otherwise(0)
+        ).alias("negative_count"),
+        F.round(F.sum("heat_score"), 2).alias("heat_sum"),
+        F.round(F.avg("heat_score"), 2).alias("heat_avg"),
+    )
+    .withColumn(
+        "negative_ratio",
+        F.round(
+            F.when(F.col("comment_count") > 0,
+                   F.col("negative_count") / F.col("comment_count"))
+             .otherwise(0.0), 4
+        )
+    )
+)
+\end{lstlisting}
+
+各 Gold 表的存储路径与写入方式如表~\ref{tab:gold}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{Gold 层各聚合表说明}
+\label{tab:gold}
+\begin{tabular}{p{5cm}p{4cm}ll}
+\toprule
+\tablehead{表名} & \tablehead{分组键} & \tablehead{写入方式} & \tablehead{主要用途} \\
+\midrule
+\code{gold\_hourly\_metrics}      & topic + stat\_hour & Overwrite & 小时粒度趋势图 \\
+\code{gold\_daily\_metrics}       & topic + stat\_date & Overwrite & 日粒度趋势图 \\
+\tcode{gold\_daily\_top10\_comments} & topic + event\_date + rank & Overwrite & 当日热评展示 \\
+\code{gold\_alert\_events}        & alert\_key & Append & 告警记录查询 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{数据一致性保障}
+
+Silver 层的 Merge 操作与 Gold 层的 Overwrite 操作均在 \code{foreachBatch} 函数体内顺序执行。由于 Spark Driver 以单线程方式串行执行每个微批次的回调，天然避免了并发写入同一 Delta 表的冲突；Delta Lake 的事务日志则在节点重启或 I/O 异常时提供原子性保障。
+
+% ================================================================
+\section{负面舆情告警模块}
+
+\subsection{告警触发逻辑}
+
+告警检测在 Gold 层重算完成后执行，以确保基于最新聚合结果进行判断。核心逻辑分为五步：（1）从当前批次提取涉及的 \code{(topic, event\_hour)} 组合；（2）关联 Gold Hourly 表，筛选满足双重阈值条件的记录；（3）查询 Alert 表中已存在的告警键集合，实现去重；（4）从 Silver 层查询该话题该小时内热度最高的 \code{ALERT\_TOPN\_TEXTS} 条负面评论作为样例；（5）调用 \code{AlertMailer} 发送告警邮件，并将告警事件写入 Gold Alert 表。
+
+\subsection{告警邮件设计}
+
+告警邮件通过 Python 标准库 \code{smtplib} 发送，支持 SSL 与 STARTTLS 两种加密模式，兼容 QQ 邮箱、163 邮箱等国内主流 SMTP 服务（默认 SSL，端口 465）。邮件正文包含话题名称、统计小时、评论总数、负面占比及 Top-3 高热度负面评论样例。
+
+\subsection{告警配置管理}
+
+所有告警相关配置通过 \code{/opt/pipeline/conf/alert.env} 环境变量文件进行管理，实现配置与代码的分离，关键配置项已列于表~\ref{tab:alert-config}。
+
+% ================================================================
+\section{REST API 数据服务模块}
+
+\subsection{数据读取策略}
+
+API 服务通过 \code{deltalake} Python 库（Delta Lake 的纯 Python 实现，无需 JVM）直接读取 Delta Lake 目录，转换为 Pandas DataFrame 后进行内存级的过滤、排序与序列化处理。相较于通过 SparkSession 读取的方案，这一策略显著降低了每次 API 请求的响应延迟和资源消耗。
+
+\subsection{数据序列化处理}
+
+Pandas DataFrame 在转换为 JSON 过程中存在若干类型兼容性问题，如 \code{pd.Timestamp} 无法直接序列化、NumPy 数值类型不兼容标准 JSON 等。系统通过 \code{normalize\_value} 函数对每个字段值进行类型归一化处理：
+
+\begin{lstlisting}[language=Python, caption={数据序列化类型归一化}, label={lst:serial}]
+def normalize_value(v):
+    if isinstance(v, pd.Timestamp):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if hasattr(v, "item"):          # NumPy 标量转 Python 原生类型
+        return v.item()
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+\end{lstlisting}
+
+\subsection{核心接口实现}
+
+\code{/api/dashboard} 聚合接口一次性返回 meta、summary、daily、hourly、alerts 五组数据，减少前端在页面加载时的 HTTP 请求次数，提升首屏渲染速度。\code{/api/comments} 接口支持 \code{view=daily}（按天，返回热度前 30 条）和 \code{view=hourly}（按小时，返回最多 2000 条）两种模式，并在响应中附带 \code{bucket\_options} 列表，使前端下拉选择框无需额外请求即可渲染。
+
+% ================================================================
+\section{前端可视化模块}
+
+\subsection{整体布局设计}
+
+前端采用单页应用（SPA）架构，全部逻辑集中于 \code{App.vue} 单文件组件。页面布局分为四个垂直区域：（1）Hero 头部控制栏（话题选择、粒度切换、时间桶选择、刷新按钮）；（2）六个 KPI 指标卡；（3）三张 ECharts 折线图（2+1 布局，热度图全宽）；（4）评论明细表与告警记录面板并排展示。页面整体采用玻璃拟态（Glassmorphism）设计语言，通过 \code{backdrop-filter: blur(18px)} 与半透明背景色营造现代化视觉层次感。
+
+\subsection{数据获取与状态管理}
+
+页面采用 Vue~3 Composition API 进行状态管理，数据获取逻辑集中于 \code{refreshAll} 函数，在页面初始化（\code{onMounted}）、点击刷新按钮、切换话题（\code{handleTopicChange}）等场景中触发。粒度切换（\code{switchGranularity}）仅重新请求评论数据，不重置 dashboard 数据，避免不必要的网络请求。
+
+\subsection{ECharts 图表渲染}
+
+三个 ECharts 实例分别挂载于 \code{countChartRef}、\code{ratioChartRef}、\code{heatChartRef} 三个 DOM 引用上，通过 \code{renderCharts} 函数统一更新。\code{watch(trendRows,~...)} 深度监听趋势数据变化，在数据更新后自动触发重渲染。\code{window.resize} 事件监听确保浏览器窗口调整时图表自适应重绘。图表 X 轴标签按粒度分别截取日期（\code{yyyy-MM-dd}）或小时（\code{MM-dd HH:mm}）格式，并通过 \code{axisLabel.rotate: 30} 倾斜显示，防止标签重叠。
+
+\subsection{响应式适配}
+
+页面通过 CSS 媒体查询实现多分辨率适配：分辨率不低于 1600\,px 时，KPI 卡以 6 列展示，趋势图以 2 列布局，评论表与告警面板并排；分辨率低于 1200\,px 时，各区域切换为单列纵向堆叠；分辨率低于 700\,px 时，字号与边距进一步压缩。
+
+% ================================================================
+\section{系统部署配置}
+
+\subsection{云服务器端部署}
+
+系统后端部署于阿里云 Linux~3 服务器，各组件部署路径如表~\ref{tab:deploy}~所示。
+
+\begin{table}[htbp]
+\centering
+\caption{后端组件部署路径与启动方式}
+\label{tab:deploy}
+\begin{tabular}{lp{5.5cm}p{5cm}}
+\toprule
+\tablehead{组件} & \tablehead{部署路径} & \tablehead{启动方式} \\
+\midrule
+Spark Streaming 任务 & \code{/opt/pipeline/jobs/}               & \tcode{bash scripts/}\newline\tcode{run\_stream\_single\_topic.sh} \\
+FastAPI 服务         & \code{/opt/pipeline/api/}                & \code{bash scripts/run\_api.sh} \\
+配置文件             & \tcode{/opt/pipeline/conf/}\newline\tcode{alert.env}      & 环境变量注入 \\
+Delta Lake 数据目录  & \tcode{/data/public-opinion/}\newline\tcode{delta/}       & 自动创建 \\
+Checkpoint 目录      & \tcode{/data/public-opinion/}\newline\tcode{checkpoints/} & 自动创建 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Spark 提交配置}
+
+Spark 任务通过 \code{spark-submit} 命令提交，关键参数如下所示：
+
+\begin{lstlisting}[language=bash, caption={spark-submit 关键参数}, label={lst:submit}]
+spark-submit \
+  --master local[*] \
+  --packages io.delta:delta-spark_2.12:3.3.2,\
+             org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8 \
+  --conf spark.driver.memory=2g \
+  --conf spark.executor.memory=2g \
+  --conf spark.sql.session.timeZone=Asia/Shanghai \
+  /opt/pipeline/jobs/stream_single_topic_to_delta.py
+\end{lstlisting}
+
+\code{local[*]} 模式指定使用本机全部 CPU 核心，适合单机部署场景；时区配置项 \code{spark.sql.session.timeZone} 设置为 \code{Asia/Shanghai}，确保时间截断以中国标准时间为基准，防止小时桶计算出现时区偏移。
+

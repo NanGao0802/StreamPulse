@@ -1,0 +1,35 @@
+% ============================================================
+%  摘要（中文 + 英文）
+% ============================================================
+
+% -------------------- 中文摘要 --------------------
+\chapter*{摘\quad 要}
+\addcontentsline{toc}{chapter}{摘要}
+\markboth{摘要}{摘要}
+
+近年来，随着微博、抖音、小红书、B 站、知乎等社交媒体平台的快速兴起，用户生成内容（User Generated Content，UGC）呈现指数级增长态势，舆情信息的实时感知与分析已成为政府公共治理、企业品牌维护、社会应急管理等领域的核心技术需求。然而，传统基于批处理架构的舆情分析系统普遍存在处理延迟高、数据时效性差、无法快速响应突发舆情事件等固有局限，难以满足当前高频、海量、多源异构数据环境下的实时分析要求。
+
+本文针对上述问题，设计并实现了一套基于 Apache Spark Structured Streaming 的实时舆情分析与热度趋势监测系统。系统采用 Kafka 作为高吞吐消息队列，以 60 秒为一个微批次触发周期持续消费多平台社交媒体评论数据流；在流处理层集成阿里巴巴达摩院 StructBERT 中文预训练语言模型，实现对评论文本的情感极性分类（正向/负向/中性），并据此构建综合考量点赞数、转发数与情感极性的多维热度评分模型；存储层采用 Delta Lake 数据湖仓一体方案，设计 Bronze-Silver-Gold 三层渐进式数据模型，分别承担原始数据落盘、清洗去重以及多粒度聚合统计的职责；服务层基于 FastAPI 构建 RESTful 数据接口，前端采用 Vue~3 与 ECharts 实现多话题实时监测可视化大屏；系统还内置了基于规则的负面舆情告警机制，当检测到特定话题在某小时内负面评论占比超过阈值时，自动触发邮件告警并持久化预警记录。
+
+本系统在阿里云 Linux 服务器环境下完成部署与验证，实验结果表明，系统能够在 60 秒处理周期内完成对多话题评论流的接收、情感推理、热度计算与数据入湖，端到端延迟满足准实时监测需求，各模块功能指标均达到设计预期。
+
+\vspace{1em}
+\noindent\textbf{关键词：}流式计算；Spark Structured Streaming；舆情分析；情感分类；StructBERT；Delta Lake；热度模型；实时告警
+
+\clearpage
+
+% -------------------- 英文摘要 --------------------
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\markboth{Abstract}{Abstract}
+
+In recent years, with the rapid rise of social media platforms such as Weibo, Douyin, Xiaohongshu, Bilibili, and Zhihu, user-generated content (UGC) has grown exponentially. The real-time perception and analysis of public opinion information has become a core technological requirement in government governance, corporate brand management, and social emergency response. However, traditional batch-processing-based public opinion analysis systems generally suffer from high processing latency, poor data timeliness, and inability to respond quickly to emergent public opinion events, making them inadequate for the demands of high-frequency, massive, and heterogeneous streaming data environments.
+
+In response to the above challenges, this paper designs and implements a real-time public opinion analysis and heat trend monitoring system based on Apache Spark Structured Streaming. The system uses Apache Kafka as a high-throughput message queue, triggering micro-batch processing every 60 seconds to continuously consume multi-platform social media comment streams. At the stream processing layer, the system integrates the StructBERT Chinese pre-trained language model from Alibaba DAMO Academy to perform sentiment polarity classification (positive/negative/neutral) on comment texts, and constructs a multi-dimensional heat scoring model that incorporates like counts, repost counts, and sentiment polarity. The storage layer adopts the Delta Lake lakehouse architecture, implementing a three-tier progressive data model (Bronze-Silver-Gold) responsible for raw data ingestion, deduplication and cleansing, and multi-granularity aggregation statistics respectively. The service layer exposes RESTful APIs via FastAPI, while the frontend employs Vue~3 and ECharts to deliver a real-time multi-topic monitoring dashboard. The system also incorporates a rule-based negative sentiment alerting mechanism that automatically triggers email notifications and persists alert records when the ratio of negative comments for a given topic in a specific hour exceeds the configured threshold.
+
+The system was deployed and validated on an Alibaba Cloud Linux server. Experimental results demonstrate that the system can complete the reception, sentiment inference, heat computation, and data lakehouse ingestion of multi-topic comment streams within a 60-second processing cycle, with end-to-end latency satisfying the requirements of near-real-time monitoring. All module functional metrics meet the design expectations.
+
+\vspace{1em}
+\noindent\textbf{Keywords:} Stream Computing; Spark Structured Streaming; Public Opinion Analysis; Sentiment Classification; StructBERT; Delta Lake; Heat Scoring Model; Real-Time Alerting
+
+\clearpage

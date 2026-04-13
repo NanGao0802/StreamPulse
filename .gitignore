@@ -1,0 +1,57 @@
+# ============================================================
+#  Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.bak
+
+# ============================================================
+#  Node / Frontend
+# ============================================================
+node_modules/
+frontend/dist/
+frontend/.env.local
+frontend/.env.*.local
+
+# ============================================================
+#  LaTeX 编译产物（保留源码和 figures/，排除中间文件）
+# ============================================================
+thesis/latex/*.aux
+thesis/latex/*.log
+thesis/latex/*.out
+thesis/latex/*.bbl
+thesis/latex/*.blg
+thesis/latex/*.toc
+thesis/latex/*.fls
+thesis/latex/*.fdb_latexmk
+thesis/latex/*.synctex.gz
+thesis/latex/chapters/*.aux
+# PDF 体积较大，可按需取消注释来排除
+# thesis/latex/main.pdf
+
+# ============================================================
+#  爬虫数据（运行时产生，不入库）
+# ============================================================
+crawler/data/
+crawler/cache/
+crawler/__pycache__/
+crawler/**/__pycache__/
+
+# ============================================================
+#  系统 / IDE
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/settings.json
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,23 @@
+﻿* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  font-family:
+    Inter,
+    "SF Pro Display",
+    "PingFang SC",
+    "Microsoft YaHei",
+    Arial,
+    sans-serif;
+  color: #0f172a;
+}
+
+body {
+  background: #f6f9ff;
+}
