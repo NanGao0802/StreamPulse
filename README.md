@@ -1,68 +1,79 @@
-# 基于 Structured Streaming 的实时舆情分析与热度趋势监测系统
+# StreamPulse — 基于 Structured Streaming 的实时舆情分析系统
 
-> 毕业设计项目 · 面向社交媒体评论流的实时舆情监测平台
+> 天津工业大学 · 2026 届毕业设计 · 大数据 2201 · 高楠
+
+**StreamPulse** 是一套端到端的**实时舆情分析与热度趋势监测**平台，以 Apache Kafka + Spark Structured Streaming 为核心流处理引擎，集成 StructBERT 中文情感模型与 Delta Lake 湖仓架构，实现从多平台社交媒体评论采集、准实时流处理、情感极性分类、热度计算到可视化大屏展示的完整闭环。
 
 ---
 
-## 项目简介
+## ✨ 系统特色
 
-本系统是一套端到端的**实时舆情分析与热度趋势监测**解决方案，以 Apache Kafka + Spark Structured Streaming 为核心流处理引擎，结合 StructBERT 中文情感分类模型、Delta Lake 数据湖架构，构建从社交媒体数据采集、实时流处理、情感分析、热度计算到可视化展示的完整链路。系统支持多话题同时监测、按天/按小时趋势分析、负面舆情自动告警与邮件通知。
+| 特性 | 说明 |
+|------|------|
+| **准实时处理** | 60 秒微批次触发，端到端延迟满足准实时监测需求 |
+| **多平台接入** | 支持微博、抖音、B站、小红书、知乎、快手、贴吧 7 大平台 |
+| **中文情感分析** | 集成阿里达摩院 StructBERT，正/负/中性三分类，批量推理 batch_size=32 |
+| **湖仓一体存储** | Delta Lake Bronze-Silver-Gold 三层渐进式数据精炼，支持 ACID 与 Time Travel |
+| **自动告警** | 负面舆情占比超阈值时自动发送 SMTP 告警邮件，同一小时去重 |
+| **可视化大屏** | Vue 3 + ECharts 单页应用，多话题切换、按天/小时粒度趋势图、评论明细与告警面板 |
 
 ---
 
 ## 系统架构
 
+系统采用**五层分布式架构**，由下至上依次为：
+
 ```
-社交媒体平台
-  (微博 / 抖音 / B站 / 小红书 / 知乎 / 快手 / 贴吧)
-         │
-         ▼
-  ┌─────────────┐
-  │   爬虫模块   │  轮询抓取评论，输出 JSONL 文件
-  └──────┬──────┘
-         │ JSONL
-         ▼
-  ┌─────────────┐
-  │    Kafka    │  Topic: public_opinion_raw
-  └──────┬──────┘
-         │ 消息流
-         ▼
-  ┌────────────────────────────────────┐
-  │   Spark Structured Streaming        │
-  │   (60s micro-batch)                │
-  │                                    │
-  │   ┌──────────────────────────┐     │
-  │   │  StructBERT 情感分类      │     │
-  │   │  正向 / 中性 / 负向       │     │
-  │   └──────────────────────────┘     │
-  │                                    │
-  │   热度分数 = 1.0                   │
-  │           + 点赞数 × 0.6           │
-  │           + 转发数 × 1.0           │
-  │           + 情绪加成(负:1.5/中:0.5/正:0.2) │
-  └──────┬─────────────────────────────┘
-         │
-         ▼
-  ┌─────────────────────────────────────────┐
-  │            Delta Lake 数据湖             │
-  │                                         │
-  │  Bronze  →  Silver  →  Gold (Hourly)    │
-  │  (原始+全量)  (去重精炼)  (Gold Daily)   │
-  │                          (Gold Top10)   │
-  │                          (Alert Events) │
-  └──────┬──────────────────────────────────┘
-         │
-         ▼
-  ┌─────────────┐        ┌──────────────────┐
-  │  FastAPI    │ ◄────► │  Vue 3 前端大屏   │
-  │  REST API   │        │  ECharts 可视化   │
-  └─────────────┘        └──────────────────┘
-         │
-         ▼
-  ┌─────────────┐
-  │  邮件告警    │  负面占比 > 40% 时自动触发
-  └─────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  展示层（前端）                                               │
+│  Vue 3 + Vite · Apache ECharts 6                            │
+│  多话题切换 · KPI 卡 · 趋势折线图 · 评论明细表 · 告警面板     │
+│                         ▲ HTTP REST / JSON                  │
+├─────────────────────────────────────────────────────────────┤
+│  数据服务层（API）                                            │
+│  FastAPI · 监听端口 18000                                    │
+│  /api/dashboard · /api/comments · /api/alerts 等 9 个端点   │
+│                       ▲ deltalake 直接读取                  │
+├─────────────────────────────────────────────────────────────┤
+│  数据存储层（湖仓）                                           │
+│  Delta Lake（本地文件系统）                                   │
+│  Bronze · Silver · Gold Hourly/Daily/Top10 · Alert Events   │
+│                       ▲ foreachBatch 写入                   │
+├─────────────────────────────────────────────────────────────┤
+│  流计算层（Spark Structured Streaming）                       │
+│  60s 微批次触发 · StructBERT 情感推理 · 热度计算             │
+│  foreachBatch: Bronze写入→Silver Merge→Gold重算→告警检测     │
+│                       ▲ readStream（消息流）                 │
+├─────────────────────────────────────────────────────────────┤
+│  消息队列层（Apache Kafka）                                   │
+│  Topic: public_opinion_raw  Broker: 172.16.156.151:9092     │
+│  持久化日志 · At-Least-Once 消费语义 · Offset 检查点管理      │
+│                       ▲ JSONL / Kafka Producer              │
+├─────────────────────────────────────────────────────────────┤
+│  数据采集层（爬虫）                                           │
+│  MediaCrawler 多平台异步爬虫 · CDP 反检测                    │
+│  微博 · B站 · 抖音 · 小红书 · 知乎 · 快手 · 贴吧             │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+### foreachBatch 五步处理流水线
+
+每个 60 秒批次按以下顺序执行：
+
+```
+① Kafka Source  →  ② JSON 解析  →  ③ 字段过滤  →  ④ StructBERT 推理  →  ⑤ 热度计算
+                                                                              │ enriched_df
+                                                                              ▼
+                    Bronze 写入  ←  Silver Merge  ←  Gold 重算  ←  告警检测
+```
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| ① | Kafka Source | 按 Offset 读取最新消息，每批最多 50 条 |
+| ② | JSON 解析 | `from_json` 按预定义 Schema 解析，追加 Kafka 元数据 |
+| ③ | 字段过滤 | 过滤 `event_id` / `text` / `publish_time` / `topic` 任一为空的记录 |
+| ④ | StructBERT 推理 | 批量调用情感 Pipeline，追加 5 个情感字段 |
+| ⑤ | 热度计算 | 计算 `heat_score` / `risk_level` / `event_hour` / `event_date` 等衍生字段 |
 
 ---
 
@@ -244,52 +255,64 @@ API 地址通过 `.env.development` 中的 `VITE_API_BASE` 配置（默认 `http
 
 ---
 
-## 核心技术栈总览
+## 核心技术栈
 
-| 层次 | 技术 |
-|------|------|
-| 数据采集 | Python + Playwright (CDP) + httpx |
-| 消息队列 | Apache Kafka |
-| 流计算引擎 | Apache Spark 3.5 Structured Streaming |
-| 情感分析模型 | StructBERT（ModelScope, 中文二分类） |
-| 数据存储 | Delta Lake（Bronze / Silver / Gold 三层） |
-| 后端 API | Python FastAPI + deltalake + pandas |
-| 前端 | Vue 3 + Vite + ECharts |
-| 告警通知 | SMTP 邮件（Python smtplib） |
-| 部署环境 | Linux 云服务器（`/opt/pipeline/`） |
+| 层次 | 技术 | 版本 |
+|------|------|------|
+| 数据采集 | Python + Playwright (CDP) + httpx | Python 3.12 |
+| 消息队列 | Apache Kafka | 3.x |
+| 流计算引擎 | Apache Spark Structured Streaming | 3.5.x |
+| Delta Lake | delta-spark + delta-kernel | 3.3.2 |
+| 情感分析 | StructBERT（阿里 ModelScope 中文预训练）| `iic/nlp_structbert_sentiment-classification_chinese-base` |
+| 深度学习 | PyTorch + ModelScope | — |
+| 后端 API | FastAPI + uvicorn + deltalake + pandas | Python 3.12 |
+| 前端框架 | Vue 3 + Vite | Vue 3.5 / Vite 6 |
+| 数据可视化 | Apache ECharts | 5.x |
+| 告警通知 | Python smtplib（SMTP over TLS）| — |
+| 部署环境 | Linux 云服务器 `/opt/pipeline/` | Alibaba Cloud ECS |
 
 ---
 
-## 数据流关键字段说明
+## 数据模型
 
-评论数据经爬虫采集后，以如下 JSON Schema 写入 Kafka：
+### Kafka 消息 Schema
 
 ```json
 {
-  "event_id":     "唯一事件 ID（用于去重）",
-  "platform":     "来源平台（bili / wb / xhs 等）",
+  "event_id":     "唯一事件 ID（用于 Silver 层去重）",
+  "platform":     "来源平台（bili / wb / xhs / dy / zhihu / ks / tieba）",
   "topic":        "话题关键词",
   "publish_time": "发布时间（yyyy-MM-dd HH:mm:ss）",
-  "time_id":      "时间桶 ID",
   "text":         "评论正文",
-  "like_count":   "点赞数",
-  "repost_count": "转发数",
-  "ingest_time":  "入库时间",
-  "source_file":  "来源文件路径"
+  "like_count":   "点赞数（整型）",
+  "repost_count": "转发数（整型）",
+  "ingest_time":  "入库时间戳",
+  "source_file":  "来源 JSONL 文件路径"
 }
 ```
 
-经 Spark 处理后，Silver 层额外新增字段：
+### Delta Lake 三层数据模型
 
-```
-sentiment_label      # positive / negative / neutral
-sentiment_score      # 正负概率差值 [-1, 1]
-sentiment_confidence # 模型置信度
-heat_score           # 热度分数（自定义公式）
-risk_level           # high / medium / low
-event_hour           # 所属小时（用于小时聚合）
-event_date           # 所属日期（用于日聚合）
-```
+| 层级 | 表名 | 写入模式 | 内容 |
+|------|------|----------|------|
+| **Bronze** | `bronze_comments_raw` | Append（按日期分区）| Kafka 原始消息 + StructBERT 情感推理结果，保留全量历史 |
+| **Silver** | `silver_comments_enriched` | Merge（按 `event_id` 去重）| 精炼评论，新增 `heat_score` / `risk_level` / `event_hour` / `event_date` |
+| **Gold Hourly** | `gold_hourly_metrics` | Overwrite | 按 `topic + event_hour` 聚合：评论数、负面数、负面占比、平均热度 |
+| **Gold Daily** | `gold_daily_metrics` | Overwrite | 按 `topic + event_date` 聚合：同上 |
+| **Gold Top10** | `gold_daily_top10_comments` | Overwrite | 每话题每日热度 Top10 评论 |
+| **Alert Events** | `gold_alert_events` | Append（Merge 去重）| 已触发的小时级负面舆情预警记录 |
+
+### Silver 层新增字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sentiment_label` | string | `positive` / `negative` / `neutral` |
+| `sentiment_score` | float | 正负概率差值，范围 `[-1, 1]` |
+| `sentiment_confidence` | float | 模型置信度；< 0.72 时强制归为 `neutral` |
+| `heat_score` | float | `1.0 + like×0.6 + repost×1.0 + 情感加成`（负:+1.5 / 中:+0.5 / 正:+0.2）|
+| `risk_level` | string | `high`（负向且热度≥12）/ `medium`（负向且热度≥5）/ `low` |
+| `event_hour` | string | `yyyy-MM-dd HH:00:00`，用于小时聚合 |
+| `event_date` | string | `yyyy-MM-dd`，用于日聚合 |
 
 ---
 
@@ -340,3 +363,20 @@ npm run dev
 | `VITE_API_BASE` | `frontend/.env.development` | 前端 API 地址，默认 `http://127.0.0.1:18000` |
 | `PLATFORM` | `crawler/config/base_config.py` | 爬取平台选择 |
 | `SAVE_DATA_OPTION` | 同上 | 数据存储方式（postgresql / csv / json 等） |
+
+---
+
+## License
+
+本仓库代码以 [MIT License](LICENSE) 开源。
+
+`crawler/` 目录基于 [MediaCrawler](https://github.com/NanGao0802/MediaCrawler) 二次开发，遵循其原始 License。
+
+---
+
+## 论文引用
+
+本项目为以下毕业设计论文的配套代码：
+
+> 高楠. 基于 Structured Streaming 的实时舆情分析与热度趋势监测系统设计 [D].  
+> 天津：天津工业大学，2026.
