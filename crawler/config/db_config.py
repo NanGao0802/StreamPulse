@@ -11,7 +11,7 @@
 
 import os
 
-# mysql config - 使用MindSpider的数据库配置
+# MySQL 数据库配置
 MYSQL_DB_PWD = "bettafish"
 MYSQL_DB_USER = "bettafish"
 MYSQL_DB_HOST = "127.0.0.1"
@@ -44,7 +44,7 @@ sqlite_db_config = {
     "db_path": SQLITE_DB_PATH
 }
 
-# postgresql config - 使用MindSpider的数据库配置（如果DB_DIALECT是postgresql）或环境变量
+# PostgreSQL 数据库配置（优先读取环境变量，缺省使用默认值）
 POSTGRESQL_DB_PWD = os.getenv("POSTGRESQL_DB_PWD", "bettafish")
 POSTGRESQL_DB_USER = os.getenv("POSTGRESQL_DB_USER", "bettafish")
 POSTGRESQL_DB_HOST = os.getenv("POSTGRESQL_DB_HOST", "127.0.0.1")
