@@ -16,8 +16,8 @@ load_dotenv("/opt/pipeline/conf/alert.env")
 
 APP_NAME = "multi-topic-comment-pipeline-structbert-alert"
 
-KAFKA_BOOTSTRAP = "172.16.156.151:9092"
-KAFKA_TOPIC = "public_opinion_raw"
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "public_opinion_raw")
 
 BASE_PATH = "/data/public-opinion/delta/single_topic_comments"
 BRONZE_PATH = f"{BASE_PATH}/bronze_comments_raw"
